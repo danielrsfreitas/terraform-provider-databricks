@@ -2,18 +2,10 @@ package permissions
 
 import (
 	"fmt"
-	"net/http"
 	"net/url"
 	"testing"
-	"time"
 
-	"github.com/databricks/databricks-sdk-go/apierr"
-	"github.com/databricks/databricks-sdk-go/experimental/mocks"
-	iammocks "github.com/databricks/databricks-sdk-go/experimental/mocks/service/iam"
 	"github.com/databricks/databricks-sdk-go/service/iam"
-	"github.com/stretchr/testify/mock"
-
-	"github.com/databricks/terraform-provider-databricks/internal/retrier"
 	"github.com/databricks/terraform-provider-databricks/qa"
 )
 
@@ -104,26 +96,78 @@ func TestResourceRuleSetCreate(t *testing.T) {
 	})
 }
 
-// useFastRuleSetConflictBackoff makes the waits between conflict retries negligible.
-func useFastRuleSetConflictBackoff(t *testing.T) {
-	original := ruleSetConflictBackoff
-	ruleSetConflictBackoff = retrier.BackoffPolicy{Initial: time.Nanosecond, Maximum: time.Nanosecond, Factor: 1}
-	t.Cleanup(func() { ruleSetConflictBackoff = original })
-}
-
-var (
-	ruleSetConflictErr = &apierr.APIError{
-		StatusCode: http.StatusConflict,
-		ErrorCode:  "RESOURCE_CONFLICT",
-		Message:    "Conflict with another RuleSet operation",
-	}
-	testManagerGrantRules = []iam.GrantRule{
-		{
-			Principals: []string{"users/abc@example.com"},
-			Role:       "roles/servicePrincipal.manager",
+func TestResourceRuleSetCreateConflict(t *testing.T) {
+	qa.ResourceFixture{
+		Fixtures: []qa.HTTPFixture{
+			{
+				Method:   "GET",
+				Resource: getResourceName(testServicePrincipalRuleSetName, ""),
+				Response: iam.RuleSetResponse{
+					Name: testServicePrincipalRuleSetName,
+					Etag: "etagEx=",
+				},
+			},
+			{
+				Method:   "PUT",
+				Resource: ruleSetApiPath,
+				ExpectedRequest: iam.UpdateRuleSetRequest{
+					Name: testServicePrincipalRuleSetName,
+					RuleSet: iam.RuleSetUpdateRequest{
+						Name: testServicePrincipalRuleSetName,
+						Etag: "etagEx=",
+						GrantRules: []iam.GrantRule{
+							{
+								Principals: []string{"users/abc@example.com"},
+								Role:       "roles/servicePrincipal.manager",
+							},
+						},
+					},
+				},
+				Response: map[string]string{
+					"error_code": "RESOURCE_CONFLICT",
+					"message":    "Conflict with another RuleSet operation",
+				},
+				Status: 409,
+			},
+			{
+				Method:   "GET",
+				Resource: getResourceName(testServicePrincipalRuleSetName, ""),
+				Response: iam.RuleSetResponse{
+					Name: testServicePrincipalRuleSetName,
+					Etag: "etagEx2=",
+				},
+			},
+			{
+				Method:   "PUT",
+				Resource: ruleSetApiPath,
+				ExpectedRequest: iam.UpdateRuleSetRequest{
+					Name: testServicePrincipalRuleSetName,
+					RuleSet: iam.RuleSetUpdateRequest{
+						Name: testServicePrincipalRuleSetName,
+						Etag: "etagEx2=",
+						GrantRules: []iam.GrantRule{
+							{
+								Principals: []string{"users/abc@example.com"},
+								Role:       "roles/servicePrincipal.manager",
+							},
+						},
+					},
+				},
+				Response: iam.RuleSetResponse{
+					Name: testServicePrincipalRuleSetName,
+					Etag: "etagEx3=",
+					GrantRules: []iam.GrantRule{
+						{
+							Principals: []string{"users/abc@example.com"},
+							Role:       "roles/servicePrincipal.manager",
+						},
+					},
+				},
+			},
 		},
-	}
-	testManagerRuleSetHCL = fmt.Sprintf(`
+		Resource: ResourceAccessControlRuleSet(),
+		Create:   true,
+		HCL: fmt.Sprintf(`
 		name = "%s"
 
 		grant_rules {
@@ -131,62 +175,12 @@ var (
 				"users/abc@example.com"
 			]
 			role = "roles/servicePrincipal.manager"
-		}`, testServicePrincipalRuleSetName)
-)
-
-// expectEtagReadAndWrite expects one read of the latest etag, followed by a write
-// of testManagerGrantRules with that etag, and returns the write call.
-func expectEtagReadAndWrite(api *iammocks.MockAccountAccessControlProxyInterface, etag string) *iammocks.MockAccountAccessControlProxyInterface_UpdateRuleSet_Call {
-	api.EXPECT().GetRuleSet(mock.Anything, iam.GetRuleSetRequest{Name: testServicePrincipalRuleSetName}).
-		Return(&iam.RuleSetResponse{Name: testServicePrincipalRuleSetName, Etag: etag}, nil).Once()
-	write := api.EXPECT().UpdateRuleSet(mock.Anything, iam.UpdateRuleSetRequest{
-		Name: testServicePrincipalRuleSetName,
-		RuleSet: iam.RuleSetUpdateRequest{
-			Name:       testServicePrincipalRuleSetName,
-			Etag:       etag,
-			GrantRules: testManagerGrantRules,
-		},
-	})
-	write.Once()
-	return write
-}
-
-func TestResourceRuleSetCreateConflict(t *testing.T) {
-	useFastRuleSetConflictBackoff(t)
-	qa.ResourceFixture{
-		MockWorkspaceClientFunc: func(w *mocks.MockWorkspaceClient) {
-			api := w.GetMockAccountAccessControlProxyAPI()
-			expectEtagReadAndWrite(api, "etagEx=").Return(nil, ruleSetConflictErr)
-			expectEtagReadAndWrite(api, "etagEx2=").Return(&iam.RuleSetResponse{
-				Name:       testServicePrincipalRuleSetName,
-				Etag:       "etagEx3=",
-				GrantRules: testManagerGrantRules,
-			}, nil)
-		},
-		Resource: ResourceAccessControlRuleSet(),
-		Create:   true,
-		HCL:      testManagerRuleSetHCL,
+		}`, testServicePrincipalRuleSetName),
 	}.ApplyAndExpectData(t, map[string]any{
 		"name": testServicePrincipalRuleSetName,
 		"etag": "",
 		"id":   testServicePrincipalRuleSetName,
 	})
-}
-
-func TestResourceRuleSetCreateConflictRetriesExhausted(t *testing.T) {
-	useFastRuleSetConflictBackoff(t)
-	qa.ResourceFixture{
-		MockWorkspaceClientFunc: func(w *mocks.MockWorkspaceClient) {
-			api := w.GetMockAccountAccessControlProxyAPI()
-			// The etag read stays stale, so every write conflicts.
-			for range ruleSetConflictMaxAttempts {
-				expectEtagReadAndWrite(api, "etagEx=").Return(nil, ruleSetConflictErr)
-			}
-		},
-		Resource: ResourceAccessControlRuleSet(),
-		Create:   true,
-		HCL:      testManagerRuleSetHCL,
-	}.ExpectError(t, "Conflict with another RuleSet operation")
 }
 
 func TestResourceRuleSetRead(t *testing.T) {
@@ -324,9 +318,9 @@ func TestResourceRuleSetUpdateName(t *testing.T) {
 		Fixtures: []qa.HTTPFixture{
 			{
 				Method:   "GET",
-				Resource: getResourceName(newName, ""),
+				Resource: getResourceName(testServicePrincipalRuleSetName, ""),
 				Response: iam.RuleSetResponse{
-					Name: newName,
+					Name: testServicePrincipalRuleSetName,
 					Etag: "etagEx=",
 				},
 			},
@@ -383,7 +377,6 @@ func TestResourceRuleSetUpdateName(t *testing.T) {
 }
 
 func TestResourceRuleSetUpdateConflict(t *testing.T) {
-	useFastRuleSetConflictBackoff(t)
 	qa.ResourceFixture{
 		Fixtures: []qa.HTTPFixture{
 			{

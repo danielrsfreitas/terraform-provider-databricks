@@ -23,7 +23,7 @@
 
 * Preserve `databricks_pipeline.expected_last_modified` during refresh to avoid post-apply drift ([#6133](https://github.com/databricks/terraform-provider-databricks/pull/6133)).
 
-* Retry `databricks_access_control_rule_set` create, update and delete with backoff on `RESOURCE_CONFLICT`. Previously create did not retry, and update and delete retried only once ([#6161](https://github.com/databricks/terraform-provider-databricks/issues/6161)).
+* Retry `databricks_access_control_rule_set` creation on `RESOURCE_CONFLICT`, as update and delete already do ([#6161](https://github.com/databricks/terraform-provider-databricks/issues/6161)).
 
 ### Documentation
 

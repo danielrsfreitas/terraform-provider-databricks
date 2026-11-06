@@ -4,28 +4,13 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"time"
 
 	"github.com/databricks/databricks-sdk-go/apierr"
 	"github.com/databricks/databricks-sdk-go/service/iam"
 	"github.com/databricks/terraform-provider-databricks/common"
-	"github.com/databricks/terraform-provider-databricks/internal/retrier"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
-
-// ruleSetConflictMaxAttempts bounds how many times a rule set write is attempted
-// when it keeps failing with RESOURCE_CONFLICT.
-const ruleSetConflictMaxAttempts = 5
-
-// ruleSetConflictBackoff spaces out those attempts. It is a variable so tests
-// can make the waits negligible.
-var ruleSetConflictBackoff = retrier.BackoffPolicy{Initial: time.Second, Maximum: 8 * time.Second}
-
-func isRuleSetConflict(err error) bool {
-	var aerr *apierr.APIError
-	return errors.As(err, &aerr) && aerr.StatusCode == http.StatusConflict && aerr.ErrorCode == "RESOURCE_CONFLICT"
-}
 
 func ResourceAccessControlRuleSet() common.Resource {
 	s := common.StructToSchema(
@@ -80,25 +65,37 @@ func ResourceAccessControlRuleSet() common.Resource {
 		}
 		return ruleSetGetRes.Etag, nil
 	}
-	// updateWithLatestEtag writes the rule set using its latest etag. Right after
-	// another write to the same rule set (e.g. the Delete half of a replacement),
-	// the etag read can still be stale and the write fails with RESOURCE_CONFLICT,
-	// so it re-reads the etag and retries with backoff.
-	updateWithLatestEtag := func(ctx context.Context, d *schema.ResourceData, c *common.DatabricksClient,
+	updateRuleSet := func(ctx context.Context, d *schema.ResourceData, c *common.DatabricksClient,
 		ruleSetUpdateReq iam.UpdateRuleSetRequest) (*iam.RuleSetResponse, error) {
-		attempts := 0
-		retryOnConflict := retrier.RetryIf(ruleSetConflictBackoff, func(_ *iam.RuleSetResponse, err error) bool {
-			attempts++
-			return attempts < ruleSetConflictMaxAttempts && isRuleSetConflict(err)
-		})
-		return retrier.Run(ctx, retryOnConflict, func(ctx context.Context) (*iam.RuleSetResponse, error) {
-			latestEtag, err := fetchLatestEtag(ctx, d, c, ruleSetUpdateReq.Name)
-			if err != nil {
+		latestEtag, err := fetchLatestEtag(ctx, d, c, ruleSetUpdateReq.Name)
+		if err != nil {
+			return nil, err
+		}
+		ruleSetUpdateReq.RuleSet.Etag = latestEtag
+		ruleSetUpdateRes, err := updateThroughWsOrAcc(ctx, d, c, ruleSetUpdateReq)
+		if err != nil {
+			return nil, err
+		}
+		return ruleSetUpdateRes, nil
+	}
+	handleConflictAndUpdate := func(ctx context.Context, d *schema.ResourceData, c *common.DatabricksClient,
+		ruleSetUpdateReq iam.UpdateRuleSetRequest) (*iam.RuleSetResponse, error) {
+		ruleSetUpdateRes, err := updateThroughWsOrAcc(ctx, d, c, ruleSetUpdateReq)
+		if err != nil {
+			var aerr *apierr.APIError
+			if !errors.As(err, &aerr) {
 				return nil, err
 			}
-			ruleSetUpdateReq.RuleSet.Etag = latestEtag
-			return updateThroughWsOrAcc(ctx, d, c, ruleSetUpdateReq)
-		})
+			if aerr.StatusCode == http.StatusConflict {
+				if aerr.ErrorCode == "RESOURCE_CONFLICT" {
+					// we need to get and update
+					etag, err := updateRuleSet(ctx, d, c, ruleSetUpdateReq)
+					return etag, err
+				}
+			}
+			return nil, err
+		}
+		return ruleSetUpdateRes, err
 	}
 	return common.Resource{
 		IsDual: true,
@@ -117,7 +114,15 @@ func ResourceAccessControlRuleSet() common.Resource {
 			var ruleSetUpdateReq iam.UpdateRuleSetRequest
 			common.DataToStructPointer(d, s, &ruleSetUpdateReq.RuleSet)
 			ruleSetUpdateReq.Name = ruleSetUpdateReq.RuleSet.Name
-			response, err := updateWithLatestEtag(ctx, d, c, ruleSetUpdateReq)
+			// Fetch the latest Etag
+			latestEtag, err := fetchLatestEtag(ctx, d, c, ruleSetUpdateReq.Name)
+			if err != nil {
+				return err
+			}
+			ruleSetUpdateReq.RuleSet.Etag = latestEtag
+			// Create can run right after a Delete of the same rule set (e.g. on replacement),
+			// when the etag read above may be stale, so retry on conflict like Update does.
+			response, err := handleConflictAndUpdate(ctx, d, c, ruleSetUpdateReq)
 			if err != nil {
 				return err
 			}
@@ -161,10 +166,17 @@ func ResourceAccessControlRuleSet() common.Resource {
 			if err != nil {
 				return err
 			}
+			// Fetch the latest Etag
+			latestEtag, err := fetchLatestEtag(ctx, d, c, d.Id())
+			if err != nil {
+				return err
+			}
+
 			var ruleSetUpdateReq iam.UpdateRuleSetRequest
 			common.DataToStructPointer(d, s, &ruleSetUpdateReq.RuleSet)
 			ruleSetUpdateReq.Name = ruleSetUpdateReq.RuleSet.Name
-			response, err := updateWithLatestEtag(ctx, d, c, ruleSetUpdateReq)
+			ruleSetUpdateReq.RuleSet.Etag = latestEtag
+			response, err := handleConflictAndUpdate(ctx, d, c, ruleSetUpdateReq)
 			if err != nil {
 				return err
 			}
@@ -182,11 +194,18 @@ func ResourceAccessControlRuleSet() common.Resource {
 			if err != nil {
 				return err
 			}
+			// Fetch the latest Etag
+			latestEtag, err := fetchLatestEtag(ctx, d, c, d.Id())
+			if err != nil {
+				return err
+			}
+
 			// we remove all grant rules. Account admins will still be able to update rule set
-			_, err = updateWithLatestEtag(ctx, d, c, iam.UpdateRuleSetRequest{
+			_, err = handleConflictAndUpdate(ctx, d, c, iam.UpdateRuleSetRequest{
 				Name: d.Id(),
 				RuleSet: iam.RuleSetUpdateRequest{
 					Name: d.Id(),
+					Etag: latestEtag,
 				},
 			})
 			if err != nil {

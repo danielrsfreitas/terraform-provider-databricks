@@ -114,7 +114,15 @@ func ResourceAccessControlRuleSet() common.Resource {
 			var ruleSetUpdateReq iam.UpdateRuleSetRequest
 			common.DataToStructPointer(d, s, &ruleSetUpdateReq.RuleSet)
 			ruleSetUpdateReq.Name = ruleSetUpdateReq.RuleSet.Name
-			response, err := updateRuleSet(ctx, d, c, ruleSetUpdateReq)
+			// Fetch the latest Etag
+			latestEtag, err := fetchLatestEtag(ctx, d, c, ruleSetUpdateReq.Name)
+			if err != nil {
+				return err
+			}
+			ruleSetUpdateReq.RuleSet.Etag = latestEtag
+			// Create can run right after a Delete of the same rule set (e.g. on replacement),
+			// when the etag read above may be stale, so retry on conflict like Update does.
+			response, err := handleConflictAndUpdate(ctx, d, c, ruleSetUpdateReq)
 			if err != nil {
 				return err
 			}

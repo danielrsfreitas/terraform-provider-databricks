@@ -23,6 +23,8 @@
 
 * Preserve `databricks_pipeline.expected_last_modified` during refresh to avoid post-apply drift ([#6133](https://github.com/databricks/terraform-provider-databricks/pull/6133)).
 
+* Retry `databricks_access_control_rule_set` creation on `RESOURCE_CONFLICT`, as update and delete already do ([#6161](https://github.com/databricks/terraform-provider-databricks/issues/6161)).
+
 ### Documentation
 
 ### Exporter

@@ -96,6 +96,93 @@ func TestResourceRuleSetCreate(t *testing.T) {
 	})
 }
 
+func TestResourceRuleSetCreateConflict(t *testing.T) {
+	qa.ResourceFixture{
+		Fixtures: []qa.HTTPFixture{
+			{
+				Method:   "GET",
+				Resource: getResourceName(testServicePrincipalRuleSetName, ""),
+				Response: iam.RuleSetResponse{
+					Name: testServicePrincipalRuleSetName,
+					Etag: "etagEx=",
+				},
+			},
+			{
+				Method:   "PUT",
+				Resource: ruleSetApiPath,
+				ExpectedRequest: iam.UpdateRuleSetRequest{
+					Name: testServicePrincipalRuleSetName,
+					RuleSet: iam.RuleSetUpdateRequest{
+						Name: testServicePrincipalRuleSetName,
+						Etag: "etagEx=",
+						GrantRules: []iam.GrantRule{
+							{
+								Principals: []string{"users/abc@example.com"},
+								Role:       "roles/servicePrincipal.manager",
+							},
+						},
+					},
+				},
+				Response: map[string]string{
+					"error_code": "RESOURCE_CONFLICT",
+					"message":    "Conflict with another RuleSet operation",
+				},
+				Status: 409,
+			},
+			{
+				Method:   "GET",
+				Resource: getResourceName(testServicePrincipalRuleSetName, ""),
+				Response: iam.RuleSetResponse{
+					Name: testServicePrincipalRuleSetName,
+					Etag: "etagEx2=",
+				},
+			},
+			{
+				Method:   "PUT",
+				Resource: ruleSetApiPath,
+				ExpectedRequest: iam.UpdateRuleSetRequest{
+					Name: testServicePrincipalRuleSetName,
+					RuleSet: iam.RuleSetUpdateRequest{
+						Name: testServicePrincipalRuleSetName,
+						Etag: "etagEx2=",
+						GrantRules: []iam.GrantRule{
+							{
+								Principals: []string{"users/abc@example.com"},
+								Role:       "roles/servicePrincipal.manager",
+							},
+						},
+					},
+				},
+				Response: iam.RuleSetResponse{
+					Name: testServicePrincipalRuleSetName,
+					Etag: "etagEx3=",
+					GrantRules: []iam.GrantRule{
+						{
+							Principals: []string{"users/abc@example.com"},
+							Role:       "roles/servicePrincipal.manager",
+						},
+					},
+				},
+			},
+		},
+		Resource: ResourceAccessControlRuleSet(),
+		Create:   true,
+		HCL: fmt.Sprintf(`
+		name = "%s"
+
+		grant_rules {
+			principals = [
+				"users/abc@example.com"
+			]
+			role = "roles/servicePrincipal.manager"
+		}`, testServicePrincipalRuleSetName),
+	}.ApplyAndExpectData(t, map[string]any{
+		"name": testServicePrincipalRuleSetName,
+		"etag": "",
+		"id":   testServicePrincipalRuleSetName,
+	})
+}
+
 func TestResourceRuleSetRead(t *testing.T) {
 	qa.ResourceFixture{
 		Fixtures: []qa.HTTPFixture{
